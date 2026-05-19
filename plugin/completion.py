@@ -402,7 +402,7 @@ class LspSelectCompletionCommand(LspTextCommand):
         sublime.set_timeout(functools.partial(self._on_resolved, session_name, item))
 
     def _on_resolved(self, session_name: str, item: CompletionItem) -> None:
-        if additional_edits := item.get('additionalTextEdits'):
+        if additional_edits := item.get('additionalTextEdits', []):
             apply_text_edits(self.view, additional_edits)
         if command := item.get("command"):
             debug(f'Running server command "{command}" for view {self.view.id()}')

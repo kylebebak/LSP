@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from ...protocol import AnnotatedTextEdit
 from ...protocol import ApplyWorkspaceEditParams
 from ...protocol import ApplyWorkspaceEditResult
+from ...protocol import ChangeAnnotation
+from ...protocol import ChangeAnnotationIdentifier
 from ...protocol import ClientCapabilities
 from ...protocol import CodeAction
 from ...protocol import CodeActionKind
@@ -10,6 +13,8 @@ from ...protocol import Command
 from ...protocol import CompletionItemKind
 from ...protocol import CompletionItemTag
 from ...protocol import ConfigurationParams
+from ...protocol import CreateFile
+from ...protocol import DeleteFile
 from ...protocol import Diagnostic
 from ...protocol import DiagnosticOptions
 from ...protocol import DiagnosticServerCancellationData
@@ -36,8 +41,10 @@ from ...protocol import LogMessageParams
 from ...protocol import LSPAny
 from ...protocol import LSPErrorCodes
 from ...protocol import LSPObject
+from ...protocol import MarkdownClientCapabilities
 from ...protocol import MarkupKind
 from ...protocol import MessageActionItem
+from ...protocol import PositionEncodingKind
 from ...protocol import PrepareSupportDefaultBehavior
 from ...protocol import PreviousResultId
 from ...protocol import ProgressParams
@@ -45,6 +52,7 @@ from ...protocol import ProgressToken
 from ...protocol import PublishDiagnosticsParams
 from ...protocol import Range
 from ...protocol import RegistrationParams
+from ...protocol import RenameFile
 from ...protocol import SemanticTokenModifiers
 from ...protocol import SemanticTokenTypes
 from ...protocol import ShowDocumentParams
@@ -52,9 +60,11 @@ from ...protocol import ShowDocumentResult
 from ...protocol import ShowMessageParams
 from ...protocol import ShowMessageRequestParams
 from ...protocol import SignatureHelpTriggerKind
+from ...protocol import SnippetTextEdit
 from ...protocol import SymbolKind
 from ...protocol import SymbolTag
 from ...protocol import TextDocumentClientCapabilities
+from ...protocol import TextDocumentEdit
 from ...protocol import TextDocumentSyncKind
 from ...protocol import TextEdit
 from ...protocol import TokenFormat
@@ -87,9 +97,10 @@ from .constants import MARKO_MD_PARSER_VERSION
 from .constants import RequestFlags
 from .constants import SEMANTIC_TOKENS_MAP
 from .constants import SUPPORTED_DIAGNOSTIC_TAGS
-from .edit import apply_text_edits
-from .edit import parse_workspace_edit
-from .edit import WorkspaceChanges
+from .edit import is_create_file
+from .edit import is_delete_file
+from .edit import is_rename_file
+from .edit import is_text_document_edit
 from .edit import WorkspaceEditSummary
 from .file_watcher import DEFAULT_WATCH_KIND
 from .file_watcher import file_watcher_event_type_to_lsp_file_change_type
@@ -99,6 +110,7 @@ from .file_watcher import get_file_watcher_implementation
 from .file_watcher import lsp_watch_kind_to_file_watcher_event_types
 from .logging import debug
 from .logging import exception_log
+from .logging import printf
 from .open import center_selection
 from .open import open_externally
 from .open import open_file
@@ -147,6 +159,7 @@ from abc import abstractmethod
 from enum import IntFlag
 from functools import lru_cache
 from functools import partial
+from operator import itemgetter
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -318,7 +331,18 @@ def get_initialize_params(
                 semantic_token_modifiers.append(token_modifier)
     supported_markup_kinds = [MarkupKind.Markdown, MarkupKind.PlainText]
     first_folder = workspace_folders[0] if workspace_folders else None
+    markdown_capabilities: MarkdownClientCapabilities = {
+        "parser": "marko",  # https://github.com/frostming/marko
+        "version": MARKO_MD_PARSER_VERSION
+    } if MARKO_MD_PARSER_VERSION else {
+        "parser": "Python-Markdown",  # https://python-markdown.github.io
+        "version": mdpopups.markdown.__version__  # pyright: ignore[reportAttributeAccessIssue]
+    }
     general_capabilities: GeneralClientCapabilities = {
+        "staleRequestSupport": {
+            "cancel": True,
+            "retryOnContentModified": []
+        },
         # https://microsoft.github.io/language-server-protocol/specification#regExp
         "regularExpressions": {
             # https://www.sublimetext.com/docs/completions.html#ver-dev
@@ -326,46 +350,33 @@ def get_initialize_params(
             # ECMAScript syntax is a subset of Perl syntax
             "engine": "ECMAScript"
         },
-        # https://microsoft.github.io/language-server-protocol/specification#markupContent
-        "markdown": {
-            # https://github.com/frostming/marko
-            "parser": "marko",
-            "version": MARKO_MD_PARSER_VERSION
-        } if MARKO_MD_PARSER_VERSION else {
-            # https://python-markdown.github.io
-            "parser": "Python-Markdown",
-            "version": mdpopups.markdown.__version__  # pyright: ignore[reportAttributeAccessIssue]
-
-        }
+        "markdown": markdown_capabilities,
+        "positionEncodings": [PositionEncodingKind.UTF16]
     }
     text_document_capabilities: TextDocumentClientCapabilities = {
         "synchronization": {
-            "dynamicRegistration": True,  # exceptional
-            "didSave": True,
-            "willSave": True,
-            "willSaveWaitUntil": True
-        },
-        "hover": {
             "dynamicRegistration": True,
-            "contentFormat": supported_markup_kinds
+            "willSave": True,
+            "willSaveWaitUntil": True,
+            "didSave": True
         },
         "completion": {
             "dynamicRegistration": True,
             "completionItem": {
                 "snippetSupport": True,
-                "deprecatedSupport": True,
                 "documentationFormat": supported_markup_kinds,
+                "deprecatedSupport": True,
                 "tagSupport": {
                     "valueSet": list(CompletionItemTag)
                 },
+                "insertReplaceSupport": True,
                 "resolveSupport": {
                     "properties": ["detail", "documentation", "additionalTextEdits"]
                 },
-                "insertReplaceSupport": True,
                 "insertTextModeSupport": {
                     "valueSet": [InsertTextMode.AdjustIndentation]
                 },
-                "labelDetailsSupport": True,
+                "labelDetailsSupport": True
             },
             "completionItemKind": {
                 "valueSet": list(CompletionItemKind)
@@ -375,43 +386,20 @@ def get_initialize_params(
                 "itemDefaults": ["editRange", "insertTextFormat", "data"]
             }
         },
+        "hover": {
+            "dynamicRegistration": True,
+            "contentFormat": supported_markup_kinds
+        },
         "signatureHelp": {
             "dynamicRegistration": True,
-            "contextSupport": True,
             "signatureInformation": {
-                "activeParameterSupport": True,
                 "documentationFormat": supported_markup_kinds,
                 "parameterInformation": {
                     "labelOffsetSupport": True
-                }
-            }
-        },
-        "references": {
-            "dynamicRegistration": True
-        },
-        "documentHighlight": {
-            "dynamicRegistration": True
-        },
-        "documentSymbol": {
-            "dynamicRegistration": True,
-            "hierarchicalDocumentSymbolSupport": True,
-            "symbolKind": {
-                "valueSet": symbol_kinds
+                },
+                "activeParameterSupport": True
             },
-            "tagSupport": {
-                "valueSet": symbol_tags
-            }
-        },
-        "documentLink": {
-            "dynamicRegistration": True,
-            "tooltipSupport": True
-        },
-        "formatting": {
-            "dynamicRegistration": True  # exceptional
-        },
-        "rangeFormatting": {
-            "dynamicRegistration": True,
-            "rangesSupport": True
+            "contextSupport": True
         },
         "declaration": {
             "dynamicRegistration": True,
@@ -429,6 +417,22 @@ def get_initialize_params(
             "dynamicRegistration": True,
             "linkSupport": True
         },
+        "references": {
+            "dynamicRegistration": True
+        },
+        "documentHighlight": {
+            "dynamicRegistration": True
+        },
+        "documentSymbol": {
+            "dynamicRegistration": True,
+            "symbolKind": {
+                "valueSet": symbol_kinds
+            },
+            "hierarchicalDocumentSymbolSupport": True,
+            "tagSupport": {
+                "valueSet": symbol_tags
+            }
+        },
         "codeAction": {
             "dynamicRegistration": True,
             "codeActionLiteralSupport": {
@@ -444,13 +448,33 @@ def get_initialize_params(
                     ]
                 }
             },
-            "dataSupport": True,
             "isPreferredSupport": True,
+            "dataSupport": True,
             "resolveSupport": {
                 "properties": [
                     "edit"
                 ]
             }
+        },
+        "codeLens": {
+            "dynamicRegistration": True,
+            "resolveSupport": {
+                "properties": ["command"]
+            }
+        },
+        "documentLink": {
+            "dynamicRegistration": True,
+            "tooltipSupport": True
+        },
+        "colorProvider": {
+            "dynamicRegistration": True
+        },
+        "formatting": {
+            "dynamicRegistration": True
+        },
+        "rangeFormatting": {
+            "dynamicRegistration": True,
+            "rangesSupport": True
         },
         "onTypeFormatting": {
             "dynamicRegistration": True
@@ -459,9 +483,7 @@ def get_initialize_params(
             "dynamicRegistration": True,
             "prepareSupport": True,
             "prepareSupportDefaultBehavior": PrepareSupportDefaultBehavior.Identifier,
-        },
-        "colorProvider": {
-            "dynamicRegistration": True  # exceptional
+            "honorsChangeAnnotations": True
         },
         "publishDiagnostics": {
             "relatedInformation": True,
@@ -472,34 +494,17 @@ def get_initialize_params(
             "codeDescriptionSupport": True,
             "dataSupport": True
         },
-        "diagnostic": {
-            "dynamicRegistration": True,
-            "relatedDocumentSupport": True,
-            "relatedInformation": True,
-            "tagSupport": {
-                "valueSet": SUPPORTED_DIAGNOSTIC_TAGS
-            },
-            "codeDescriptionSupport": True,
-            "markupMessageSupport": True,
-            "dataSupport": True
-        },
-        "selectionRange": {
-            "dynamicRegistration": True
-        },
         "foldingRange": {
             "dynamicRegistration": True,
             "foldingRangeKind": {
                 "valueSet": list(FoldingRangeKind)
             }
         },
-        "codeLens": {
+        "selectionRange": {
             "dynamicRegistration": True
         },
-        "inlayHint": {
-            "dynamicRegistration": True,
-            "resolveSupport": {
-                "properties": ["textEdits", "label.command"]
-            }
+        "callHierarchy": {
+            "dynamicRegistration": True
         },
         "semanticTokens": {
             "dynamicRegistration": True,
@@ -516,52 +521,71 @@ def get_initialize_params(
             "multilineTokenSupport": True,
             "augmentsSyntaxTokens": True
         },
-        "callHierarchy": {
-            "dynamicRegistration": True
-        },
         "typeHierarchy": {
             "dynamicRegistration": True
+        },
+        "inlayHint": {
+            "dynamicRegistration": True,
+            "resolveSupport": {
+                "properties": ["textEdits", "label.command"]
+            }
+        },
+        "diagnostic": {
+            "dynamicRegistration": True,
+            "relatedDocumentSupport": True,
+            "relatedInformation": True,
+            "tagSupport": {
+                "valueSet": SUPPORTED_DIAGNOSTIC_TAGS
+            },
+            "codeDescriptionSupport": True,
+            "markupMessageSupport": True,
+            "dataSupport": True
         }
     }
     workspace_capabilites: WorkspaceClientCapabilities = {
         "applyEdit": True,
-        "didChangeConfiguration": {
-            "dynamicRegistration": True
-        },
-        "executeCommand": {},
         "workspaceEdit": {
             "documentChanges": True,
             "failureHandling": FailureHandlingKind.Abort,
+            "normalizesLineEndings": True,
             "changeAnnotationSupport": {
                 "groupsOnLabel": False
-            }
-        },
-        "workspaceFolders": True,
-        "symbol": {
-            "dynamicRegistration": True,  # exceptional
-            "resolveSupport": {
-                "properties": ["location.range"]
             },
+            "metadataSupport": True,
+            "snippetEditSupport": True
+        },
+        "didChangeConfiguration": {
+            "dynamicRegistration": True
+        },
+        "symbol": {
+            "dynamicRegistration": True,
             "symbolKind": {
                 "valueSet": symbol_kinds
             },
             "tagSupport": {
                 "valueSet": symbol_tags
+            },
+            "resolveSupport": {
+                "properties": ["location.range"]
             }
         },
+        "executeCommand": {
+            "dynamicRegistration": True
+        },
+        "workspaceFolders": True,
         "configuration": True,
+        "semanticTokens": {
+            "refreshSupport": True
+        },
         "codeLens": {
             "refreshSupport": True
         },
         "fileOperations": {
             "dynamicRegistration": True,
-            "willRename": True,
-            "didRename": True
+            "didRename": True,
+            "willRename": True
         },
         "inlayHint": {
-            "refreshSupport": True
-        },
-        "semanticTokens": {
             "refreshSupport": True
         },
         "diagnostics": {
@@ -569,15 +593,15 @@ def get_initialize_params(
         }
     }
     window_capabilities: WindowClientCapabilities = {
-        "showDocument": {
-            "support": True
-        },
+        "workDoneProgress": True,
         "showMessage": {
             "messageActionItem": {
                 "additionalPropertiesSupport": True
             }
         },
-        "workDoneProgress": True
+        "showDocument": {
+            "support": True
+        }
     }
     capabilities: ClientCapabilities = {
         "general": general_capabilities,
@@ -1006,20 +1030,6 @@ class Session(APIHandler, TransportCallbacks):
         self._logged_unsupported_commands: set[str] = set()
         super().__init__()
 
-    def __getattr__(self, name: str) -> Any:
-        """If we don't have a request/notification handler, look up the request/notification handler in the plugin."""
-        if name.startswith('m_'):
-            if self._plugin:
-                # Handler added through decorator.
-                if handler_name := self._plugin.handler_attr_map.get(name):
-                    return getattr(self._plugin, handler_name)
-                # Handler added through 'm_*' method.
-                if isinstance(self._plugin, AbstractPlugin) and (plugin_handler := getattr(self._plugin, name, None)):
-                    return plugin_handler
-            if handler_name := self.handler_attr_map.get(name):
-                return getattr(self, handler_name)
-        raise AttributeError(name)
-
     # TODO: Create an assurance that the API doesn't change here as it can be used by plugins.
     def get_workspace_folders(self) -> list[WorkspaceFolder]:
         return self._workspace_folders
@@ -1242,7 +1252,6 @@ class Session(APIHandler, TransportCallbacks):
     ) -> None:
         if self._plugin_class and issubclass(self._plugin_class, LspPlugin):
             self._plugin = self._plugin_class(weakref.ref(self))
-            self._plugin.on_transport_ready_async(transport)
         self.transport = transport
         self.working_directory = working_directory
         self._variables = variables
@@ -1267,7 +1276,7 @@ class Session(APIHandler, TransportCallbacks):
                 self._plugin.on_server_response_async('initialize', Response[InitializeResult](-1, result))
         self.send_notification(Notification.initialized())
         if self._plugin and isinstance(self._plugin, LspPlugin):
-            self._plugin.on_initialize_async()
+            self._plugin.on_initialized_async()
         self._maybe_send_did_change_configuration()
         if execute_commands := self.get_capability('executeCommandProvider.commands'):
             debug(f"{self.config.name}: Supported execute commands: {execute_commands}")
@@ -1620,52 +1629,148 @@ class Session(APIHandler, TransportCallbacks):
                 .then(lambda _: None)
         return promise
 
-    def apply_workspace_edit_async(
-        self, edit: WorkspaceEdit, *, label: str | None = None, is_refactoring: bool = False
-    ) -> Promise[WorkspaceEditSummary]:
-        """
-        Apply a WorkspaceEdit, and return a promise that resolves on the async thread again after the edits have been
-        applied. The resolved promise contains a summary of the changes in the WorkspaceEdit.
-        """
-        is_refactoring = self._is_executing_refactoring_command or is_refactoring
-        return self.apply_parsed_workspace_edits(parse_workspace_edit(edit, label), is_refactoring)
-
-    def apply_parsed_workspace_edits(
-        self, changes: WorkspaceChanges, is_refactoring: bool = False
-    ) -> Promise[WorkspaceEditSummary]:
-
-        def handle_view(
-            edits: list[TextEdit],
-            label: str | None,
-            view_version: int | None,
-            uri: str,
-            view_state_actions: ViewStateActions,
-            view: sublime.View | None,
-        ) -> Promise[None]:
-            if view is None:
-                print(f'LSP: ignoring edits due to no view for uri: {uri}')
-                return Promise.resolve(None)
-            return apply_text_edits(view, edits, label=label, required_view_version=view_version) \
-                .then(lambda view: self._set_view_state(view_state_actions, view) if view else None)
-
+    def apply_document_changes_async(
+        self,
+        document_changes: list[TextDocumentEdit | CreateFile | RenameFile | DeleteFile],
+        change_annotations: dict[ChangeAnnotationIdentifier, ChangeAnnotation],
+        *,
+        label: str | None = None,
+        is_refactoring: bool = False
+    ) -> Promise[ApplyWorkspaceEditResult]:
         active_sheet = self.window.active_sheet()
         selected_sheets = self.window.selected_sheets()
-        promises: list[Promise[None]] = []
         auto_save = userprefs().refactoring_auto_save if is_refactoring else 'never'
-        summary: WorkspaceEditSummary = {
-            'total_changes': sum(len(value[0]) for value in changes.values()),
-            'edited_files': len(changes)
-        }
-        for uri, (edits, label, view_version) in changes.items():
-            view_state_actions = self._get_view_state_actions(uri, auto_save)
-            promises.append(
-                self.open_uri_async(uri)
-                    .then(partial(handle_view, edits, label, view_version, uri, view_state_actions))
-            )
-        return Promise.all(promises) \
+        index = 0  # Assuming 0-based indexing for the ApplyWorkspaceEditResult.faildedChange value
+        promise = self._apply_document_changes_recursive_async(
+            document_changes, change_annotations, index, label, auto_save)
+        promise \
             .then(lambda _: self._set_selected_sheets(selected_sheets)) \
-            .then(lambda _: self._set_focused_sheet(active_sheet)) \
-            .then(lambda _: summary)
+            .then(lambda _: self._set_focused_sheet(active_sheet))
+        return promise
+
+    def _apply_document_changes_recursive_async(
+        self,
+        document_changes: list[TextDocumentEdit | CreateFile | RenameFile | DeleteFile],
+        change_annotations: dict[ChangeAnnotationIdentifier, ChangeAnnotation],
+        index: int,
+        label: str | None,
+        auto_save: str
+    ) -> Promise[ApplyWorkspaceEditResult]:
+
+        def apply_text_document_edit(
+            view: sublime.View | None,
+            uri: DocumentUri,
+            edits: list[TextEdit | AnnotatedTextEdit | SnippetTextEdit],
+            version: int | None,
+            view_state_actions: ViewStateActions
+        ) -> Promise[str | None]:
+            if not view:
+                return Promise.resolve(f'Failed to open URI {uri}')
+            if version is not None and version != (change_count := view.change_count()):
+                return Promise.resolve(f'Document version for URI {uri} is {change_count}, but required {version}')
+            for edit in edits:
+                # Use more specific label for this particular TextDocumentEdit if available
+                if annotation_id := edit.get('annotationId'):
+                    edit_label = change_annotations[annotation_id]['label']
+                    break
+            else:
+                edit_label = label
+            view.run_command('lsp_apply_text_document_edit', {'edits': edits, 'label': edit_label})
+            promise = Promise(lambda resolve: sublime.set_timeout_async(lambda: resolve(None)))
+            if view and view_state_actions:
+                return promise.then(lambda _: self._set_view_state(view_state_actions, view))  # pyright: ignore[reportReturnType]
+            return promise
+
+        def _continue(failure_reason: str | None) -> Promise[ApplyWorkspaceEditResult]:
+            if failure_reason:
+                printf(f'Error while applying WorkspaceEdit: {failure_reason}')
+                return Promise.resolve({
+                    'applied': False,
+                    'failureReason': failure_reason,
+                    'failedChange': index
+                })
+            return self._apply_document_changes_recursive_async(
+                document_changes, change_annotations, index + 1, label, auto_save)
+
+        try:
+            document_change = document_changes.pop(0)
+        except IndexError:
+            # All document changes were handled
+            return Promise.resolve({'applied': True})
+        if is_text_document_edit(document_change):
+            text_document = document_change['textDocument']
+            uri = text_document['uri']
+            version = text_document['version']
+            view_state_actions = self._get_view_state_actions(uri, auto_save)
+            return self.open_uri_async(uri).then(
+                lambda view: apply_text_document_edit(view, uri, document_change['edits'], version, view_state_actions)
+            ).then(_continue)
+        if is_create_file(document_change):
+            # TODO: add support for ResourceOperationKind.Create
+            return Promise.resolve({
+                'applied': False,
+                'failureReason': 'CreateFile not yet supported by client',
+                'failedChange': index
+            })
+        if is_rename_file(document_change):
+            # TODO: add support for ResourceOperationKind.Rename
+            return Promise.resolve({
+                'applied': False,
+                'failureReason': 'RenameFile not yet supported by client',
+                'failedChange': index
+            })
+        if is_delete_file(document_change):
+            # TODO: add support for ResourceOperationKind.Delete
+            return Promise.resolve({
+                'applied': False,
+                'failureReason': 'DeleteFile not yet supported by client',
+                'failedChange': index
+            })
+        # Should be unreachable, but must return value on all code paths to satisfy type checker
+        return Promise.resolve({
+            'applied': False,
+            'failureReason': 'Unknown document change type',
+            'failedChange': index
+        })
+
+    def apply_workspace_edit_async(
+        self, edit: WorkspaceEdit, *, label: str | None = None, is_refactoring: bool = False
+    ) -> Promise[tuple[ApplyWorkspaceEditResult, WorkspaceEditSummary]]:
+        """
+        Apply a WorkspaceEdit, and return a promise that resolves on the async thread again after the edits have been
+        applied. The resolved promise contains the ApplyWorkspaceEditResult and a summary of the changes in the
+        WorkspaceEdit.
+        """
+        document_changes = edit.get('documentChanges', [])
+        if not document_changes:
+            document_changes.extend([
+                cast('TextDocumentEdit', {'textDocument': {'uri': uri, 'version': None}, 'edits': edits})
+                for uri, edits in edit.get('changes', {}).items()
+            ])
+        change_annotations = edit.get('changeAnnotations', {})
+        summary: WorkspaceEditSummary = {
+            'total_changes': 0,
+            'edited_files': 0,
+            'created_files': 0,
+            'renamed_files': 0,
+            'deleted_files': 0
+        }
+        for document_change in document_changes:
+            if is_text_document_edit(document_change):
+                summary['total_changes'] += len(document_change['edits'])
+                summary['edited_files'] += 1
+            elif is_create_file(document_change):
+                summary['created_files'] += 1
+            elif is_rename_file(document_change):
+                summary['renamed_files'] += 1
+            elif is_delete_file(document_change):
+                summary['deleted_files'] += 1
+        return self.apply_document_changes_async(
+            document_changes,
+            change_annotations,
+            label=label,
+            is_refactoring=is_refactoring or self._is_executing_refactoring_command
+        ).then(lambda result: (result, summary))
 
     def _get_view_state_actions(self, uri: DocumentUri, auto_save: str) -> ViewStateActions:
         """
@@ -1862,8 +1967,10 @@ class Session(APIHandler, TransportCallbacks):
 
     @request_handler('workspace/applyEdit')
     def on_workspace_apply_edit(self, params: ApplyWorkspaceEditParams) -> Promise[ApplyWorkspaceEditResult]:
-        return self.apply_workspace_edit_async(params.get('edit', {}), label=params.get('label')) \
-            .then(lambda _: {"applied": True})
+        is_refactoring = metadata.get('isRefactoring', False) if (metadata := params.get('metadata')) else False
+        return self.apply_workspace_edit_async(
+            params['edit'], label=params.get('label'), is_refactoring=is_refactoring
+        ).then(itemgetter(0))
 
     @request_handler('workspace/codeLens/refresh')
     def on_workspace_code_lens_refresh(self, _: None) -> Promise[None]:
@@ -2306,7 +2413,7 @@ class Session(APIHandler, TransportCallbacks):
                     self._plugin.on_server_notification_async(Notification(method, result))
                 elif self._plugin:
                     server_notification = cast('ServerNotification',
-                                               cast('object', {'method': method, 'result': result}))
+                                               cast('object', {'method': method, 'params': result}))
                     self._plugin.on_server_notification_async(server_notification)
                 return res
         elif "id" in payload:
@@ -2382,4 +2489,15 @@ class Session(APIHandler, TransportCallbacks):
         return (error_handler, request.method, error, True)
 
     def _get_handler(self, method: str) -> Callable | None:
-        return getattr(self, method2attr(method), None)
+        """If we don't have a request/notification handler, look up the request/notification handler in the plugin."""
+        name = method2attr(method)
+        if self._plugin:
+            # Handler added through decorator.
+            if handler_name := self._plugin.handler_attr_map.get(name):
+                return getattr(self._plugin, handler_name)
+            # Handler added through 'm_*' method.
+            if isinstance(self._plugin, AbstractPlugin) and (plugin_handler := getattr(self._plugin, name, None)):
+                return plugin_handler
+        if handler_name := self.handler_attr_map.get(name):
+            return getattr(self, handler_name)
+        return None

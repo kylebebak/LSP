@@ -51,7 +51,6 @@ def lsp_range_from_uri_fragment(fragment: str) -> Range | None:
 def open_file_uri(
     window: sublime.Window, uri: DocumentUri, flags: sublime.NewFileFlags = sublime.NewFileFlags.NONE, group: int = -1
 ) -> Promise[sublime.View | None]:
-
     decoded_uri = unquote(uri)  # decode percent-encoded characters
     open_promise = open_file(window, decoded_uri, flags, group)
     if fragment := urlparse(decoded_uri).fragment:
@@ -101,6 +100,11 @@ def open_file(
         return Promise.resolve(view)
 
     was_already_open = view is not None
+    if not was_already_open and not os.path.isfile(file):
+        # window.open_file creates a new view with empty content if the path from the given URI doesn't exist as a file
+        # on disk, but we don't want that here. If the language server wants to create a new file for a given URI, it
+        # must use the CreateFile resource operation in a WorkspaceEdit.
+        return Promise.resolve(None)
     view = window.open_file(file, flags, group)
     if not view.is_loading():
         if was_already_open and (flags & sublime.NewFileFlags.SEMI_TRANSIENT):

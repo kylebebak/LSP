@@ -40,6 +40,7 @@ from .plugin.document_link import LspOpenLinkCommand
 from .plugin.documents import DocumentSyncListener
 from .plugin.documents import TextChangeListener
 from .plugin.edit import LspApplyDocumentEditCommand
+from .plugin.edit import LspApplyTextDocumentEditCommand
 from .plugin.edit import LspApplyWorkspaceEditCommand
 from .plugin.edit import LspConcludeWorkspaceEditPanelCommand
 from .plugin.execute_command import LspExecuteCommand
@@ -95,6 +96,7 @@ __all__ = (
     "DocumentSyncListener",
     "Listener",
     "LspApplyDocumentEditCommand",
+    "LspApplyTextDocumentEditCommand",
     "LspApplyWorkspaceEditCommand",
     "LspCallHierarchyCommand",
     "LspCheckApplicableCommand",
